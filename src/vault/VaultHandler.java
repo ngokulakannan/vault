@@ -9,6 +9,7 @@ public class VaultHandler {
 
         String path = "abc.vlt";
         Vault v =new Vault(path);
+        v.addFile("xyz.txt");
 
     }
 }
