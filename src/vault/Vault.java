@@ -10,6 +10,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.util.Map;
 
 import static vault.constants.Constants.*;
 
@@ -17,11 +18,14 @@ public class Vault {
     private final Path filePath;
     private VaultIndex vaultIndex;
     private long indexAddress;
+    public enum NumberType {
+         INT, LONG
+    }
 
 
     public Vault(String path) throws IOException, InvalidVaultException {
         Path filePath = Paths.get(path);
-        int headerLength = 10; // Long.BYTES + HEADER_DELIMITER.length(); // 8 is the number of bytes of long (where index address is stored)
+        int headerLength = Long.BYTES + HEADER_DELIMITER.length(); // 8 is the number of bytes of long (where index address is stored)
         if(Files.exists(filePath)){
             this.filePath = filePath;
 
@@ -77,11 +81,7 @@ public class Vault {
                 ch.write(indexLengthBuffer);
 
                 // write index end delimiter
-                byte[] delimiterEndArray = INDEX_END_DELIMITER.getBytes(StandardCharsets.UTF_8);
-                ByteBuffer byteBufferEnd = ByteBuffer.allocate(delimiterEndArray.length);
-                byteBufferEnd.put(delimiterEndArray);
-                byteBufferEnd.flip();
-                ch.write(byteBufferEnd);
+                putNextStringIntoFile(ch.position(),INDEX_END_DELIMITER,false,ch);
 
             }
 
@@ -101,6 +101,7 @@ public class Vault {
         if(! Files.isRegularFile(sourceFilePath)){
             throw new IOException("Not a file.");
         }
+        String fileName = sourceFilePath.getFileName().toString();
 
         long[] index = this.vaultIndex.readIndex(this.indexAddress);
         long[] newIndex = new long[index.length +1];
@@ -109,16 +110,19 @@ public class Vault {
         try(FileChannel chSrc = FileChannel.open(sourceFilePath, StandardOpenOption.READ);
             FileChannel chDst = FileChannel.open(this.filePath, StandardOpenOption.WRITE, StandardOpenOption.READ)){
 
-            chDst.position(this.indexAddress  ); // move to index position in file
-            newIndex[index.length ] = this.indexAddress; // add new file entry in the new index array
-            chSrc.transferTo(0,chSrc.size(),chDst); // copy the source file data to vault's index postion
 
-            // put the current file pointer as new index address and add index delimiter to the vault
-            ByteBuffer buffer = ByteBuffer.allocate(INDEX_DELIMITER.getBytes(StandardCharsets.UTF_8).length);
-            buffer.put(INDEX_DELIMITER.getBytes(StandardCharsets.UTF_8));
-            buffer.flip();
+            newIndex[index.length ] = this.indexAddress; // add new file entry in the new index array
+
+            // Add filename at the old index position
+            putNextStringIntoFile(this.indexAddress,fileName,true,chDst);
+            putNumberIntoFile(chDst.position(),chSrc.size(),NumberType.INT,chDst); // Add file size
+            chSrc.transferTo(0,chSrc.size(),chDst); // copy the source file data to vault's index position
+
+            // put the current file pointer as new index address
             long newIndexAddress = chDst.position();
-            chDst.write(buffer);
+
+            //  add index delimiter to the vault
+            putNextStringIntoFile(chDst.position(), INDEX_DELIMITER,false,chDst);
 
             // Add the index length to the vault
             ByteBuffer indexLengthBuffer = ByteBuffer.allocate(Integer.BYTES);
@@ -132,11 +136,8 @@ public class Vault {
             chDst.write(indexBuffer);
 
             // write index end delimiter
-            byte[] delimiterEndArray = INDEX_END_DELIMITER.getBytes(StandardCharsets.UTF_8);
-            ByteBuffer byteBufferEnd = ByteBuffer.allocate(delimiterEndArray.length);
-            byteBufferEnd.put(delimiterEndArray);
-            byteBufferEnd.flip();
-            chDst.write(byteBufferEnd);
+            putNextStringIntoFile(chDst.position(),INDEX_END_DELIMITER,false,chDst);
+
 
             // Update the new index address at the beginning of the vault
             chDst.position(0);
@@ -145,15 +146,50 @@ public class Vault {
             headerBuffer.flip();
             chDst.write( headerBuffer );
 
+            // update the indexAddress to this object
+            this.indexAddress = newIndexAddress;
+
         }
 
-        System.out.println("File added succesfully to the vault: " + sourceFilePath.getFileName()  );
-
-
+        System.out.println("File added succesfully to the vault: " + fileName  );
 
     }
 
+    public void extractFile(int indexOffset) throws IOException {
+        long[] index = this.vaultIndex.readIndex(this.indexAddress);
+        long fileAddress = index[indexOffset];
+        try(FileChannel chSrc = FileChannel.open(this.filePath, StandardOpenOption.READ)){
+            String fileName = getStringFromFile(fileAddress,chSrc);
+            Path newFilePath =   Path.of( this.filePath.toAbsolutePath().getParent().toString() , fileName )  ;
+            try(FileChannel chDst = FileChannel.open(newFilePath , StandardOpenOption.WRITE,StandardOpenOption.CREATE)) {
+                if(chDst.size() >0 ){
+                    chDst.truncate(chDst.size());
+                    System.out.println("Truncate");
+                }
+                int size = getNumberFromIntoFile(chSrc.position(), NumberType.INT, chSrc ).intValue();
+                chSrc.transferTo(chSrc.position(),size,chDst);
+            }
+        }
+    }
 
+
+    public String[] getFiles() throws IOException {
+
+        long[] index = this.vaultIndex.readIndex(this.indexAddress);
+        String[] files = new String[index.length];
+
+        try (FileChannel ch = FileChannel.open(this.filePath, StandardOpenOption.READ)){
+            for(int i = 0; i< index.length; i++){
+                files[i] = getStringFromFile(index[i],ch);
+            }
+        }
+
+        return files;
+    }
+
+    public Map<Long,String> getFilesWithMetadata() throws IOException {
+        return this.vaultIndex.readIndexWithMetadata(this.indexAddress);
+    }
 
     /*    Helper Functions   */
 
@@ -165,6 +201,78 @@ public class Vault {
         }
         else {
             System.out.println("Valid headers:" + delimiter);
+        }
+    }
+
+    private String getStringFromFile(long position) throws IOException{
+        try (FileChannel ch = FileChannel.open(this.filePath, StandardOpenOption.READ)) {
+            return getStringFromFile(position,ch);
+        }
+    }
+
+    public static String getStringFromFile(long position, FileChannel ch) throws IOException{
+        ch.position(position);
+        ByteBuffer lengthBuffer = ByteBuffer.allocate(Integer.BYTES);
+        ch.read(lengthBuffer);
+        lengthBuffer.flip();
+        int length = lengthBuffer.getInt();
+        ByteBuffer nextStringBuffer = ByteBuffer.allocate( length);
+        ch.read(nextStringBuffer);
+        nextStringBuffer.flip();
+        byte[] nextStringAsBytes = new byte[length];
+        nextStringBuffer.get(nextStringAsBytes);
+        return new String(nextStringAsBytes, StandardCharsets.UTF_8);
+    }
+
+    private int putNextStringIntoFile(long position, String word, boolean storeLength, FileChannel ch) throws IOException {
+
+        byte[] wordByteArray = word.getBytes(StandardCharsets.UTF_8);
+        int length = storeLength ? (Integer.BYTES + wordByteArray.length) : wordByteArray.length;
+        ByteBuffer byteBufferEnd = ByteBuffer.allocate(length);
+        if(storeLength){
+            byteBufferEnd.putInt(wordByteArray.length);
+        }
+        byteBufferEnd.put(wordByteArray);
+        byteBufferEnd.flip();
+        ch.position(position);
+        return ch.write(byteBufferEnd);
+    }
+
+    private int putNextStringIntoFile(long position, String word, boolean storeLength) throws IOException{
+        try (FileChannel ch = FileChannel.open(this.filePath, StandardOpenOption.READ)) {
+            return putNextStringIntoFile(position,word,storeLength,ch);
+        }
+    }
+
+    private int putNumberIntoFile(long position,Number number, NumberType type,FileChannel ch) throws IOException{
+        boolean isInt = type == NumberType.INT;
+        int size = isInt? Integer.BYTES: Long.BYTES;
+        ByteBuffer byteBuffer = ByteBuffer.allocate(size);
+        ch.position(position);
+        if(isInt){
+            byteBuffer.putInt(number.intValue());
+        }
+        else {
+            byteBuffer.putLong(number.longValue());
+        }
+        byteBuffer.flip();
+        return ch.write(byteBuffer);
+
+    }
+
+    private Number getNumberFromIntoFile(long position,  NumberType type, FileChannel ch) throws IOException{
+        ch.position( position );
+
+        boolean isInt = type == NumberType.INT;
+        int size = isInt? Integer.BYTES: Long.BYTES;
+        ByteBuffer indexLengthBuffer = ByteBuffer.allocate(size);
+        ch.read(indexLengthBuffer);
+        indexLengthBuffer.flip();
+        if(isInt){
+            return indexLengthBuffer.getInt();
+        }
+        else {
+            return indexLengthBuffer.getLong();
         }
     }
 

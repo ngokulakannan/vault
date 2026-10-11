@@ -2,17 +2,19 @@ package vault;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.IntBuffer;
-import java.nio.LongBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.TreeMap;
 
+
+import static vault.Vault.getStringFromFile;
 import static vault.constants.Constants.INDEX_DELIMITER;
 
 public class VaultIndex {
-    private long[] files;
 
     private Path filePath;
 
@@ -49,6 +51,18 @@ public class VaultIndex {
             return index;
 
         }
+    }
+
+    public Map<Long,String> readIndexWithMetadata(long indexOffset) throws IOException{
+        long[] index = readIndex(indexOffset);
+        Map<Long,String> indexRecords = new TreeMap<>();
+
+        try(FileChannel ch = FileChannel.open(this.filePath, StandardOpenOption.READ)){
+            for(int i=0;i<index.length; i++) {
+                indexRecords.put(index[i], getStringFromFile(index[i],ch));
+            }
+        }
+        return indexRecords;
     }
 
 }
